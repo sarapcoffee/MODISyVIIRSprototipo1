@@ -310,7 +310,12 @@ with st.expander("Generador visual de BBOX dentro de la página", expanded=True)
     if folium is None or st_folium is None:
         st.info("Para habilitar el mapa interactivo, instala folium y streamlit-folium en el entorno.")
     else:
-        mapa = folium.Map(location=[-30, -60], zoom_start=3, tiles="CartoDB positron")
+        mapa = folium.Map(
+            location=[-30, -60],
+            zoom_start=3,
+            tiles="OpenStreetMap",
+            attr="&copy; OpenStreetMap contributors",
+        )
         draw = Draw(
             export=False,
             draw_options={
