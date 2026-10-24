@@ -2,3 +2,5 @@ streamlit==1.39.0
 pandas
 numpy
 matplotlib
+folium
+streamlit-folium
