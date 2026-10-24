@@ -1,419 +1,555 @@
-from datetime import date
+"""
+PILOTO: Calendario armonizado de actividad de incendios (MODIS + VIIRS)
 
-import streamlit as st
+Idea: los focos de incendio de MODIS (Terra/Aqua) y VIIRS (S-NPP, NOAA-20, NOAA-21)
+no se pueden sumar directamente: (1) resoluciones distintas (1 km vs 375 m), y
+(2) Terra y Aqua derivan en hora local de paso, así que muestrean otra parte del
+ciclo diario del fuego y generan cambios "falsos" en las series.
 
-import MODISyVIIRS_prot1 as core
+Este programa piloto hace estas cosas:
+  1. Estima la deriva de hora local de cada satélite DESDE LOS PROPIOS DATOS
+     (hora de adquisición + longitud -> hora solar local).
+  2. Calibra a los sensores MODIS contra VIIRS en el periodo en que ambos estaban en órbita
+     estable y arma un índice "equivalente a VIIRS" (MODIS solo se usa mientras
+     su hora de paso está cerca de la de diseño).
+  3. Genera un calendario año x día, anomalías y periodos críticos.
 
-try:
-    import folium
-    from folium.plugins import Draw
-    from streamlit_folium import st_folium
-except Exception:  # pragma: no cover - optional map extras
-    folium = None
-    Draw = None
-    st_folium = None
+USO:
+  # 1) Demo con datos SINTÉTICOS (no necesita internet ni claves):
+  la dir url o nombre del archivo.py con demo
 
-st.set_page_config(page_title="Focos | MODIS + VIIRS", page_icon="◉", layout="wide")
+  # 2) Datos reales de FIRMS (necesita MAP_KEY gratuita de NASA FIRMS):
+  export FIRMS_MAP_KEY=api_clave
+  python url o puedo poner tambien el nombre.py live --bbox=-62,-20,-55,-12 --inicio 2024-01-01 --fin 2024-12-31
 
-REGIONES_PREDEFINIDAS = {
-    "Uruguay": (-58.5, -35.2, -53.0, -30.0),
-    "Argentina": (-73.5, -55.0, -53.0, -21.0),
-    "Brasil": (-74.0, -34.0, -34.0, 7.0),
-    "América del Sur": (-81.3, -56.0, -34.0, 12.5),
-    "Personalizada": None,
+  # 3) Órbitas: hora local actual de cada satélite desde sus TLE (CelesTrak)
+  lo mismo peero con orbitas
+  #    o la serie histórica desde un archivo de TLE (p. ej. de Space-Track):
+  lo mismo o un .py orbitas --tle-file aqua_historico.tle --sat Aqua
+
+NOTA SARA (modo live): para calibrar MODIS contra VIIRS el rango de fechas debe incluir
+días en que ambos coexistían con MODIS en órbita estable (aprox. 2012-2020). Con una
+ventana reciente (p. ej. solo 2024) el índice sale solo de VIIRS. Para rangos largos
+conviene la descarga masiva del archivo de FIRMS en vez de la API por tramos.
+
+DEPENDENCIASSSS IMPORTANTES: numpy, pandas, matplotlib  (pip install numpy pandas matplotlib)
+
+El modo `demo` es el que está verificado de punta a punta. Los modos
+`live` y `orbitas` necesitan internet: revisar los nombres de fuentes/parámetros de la API de
+FIRMS en su documentación antes de usarlos en serio.
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import os
+import sys
+import time
+import urllib.request
+import warnings
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+
+# CONFIGURACIÓN
+# mlt_diseno = hora local media del paso DIURNO según el diseño de la misión.
+SENSORES = {
+    "Terra":  {"familia": "MODIS", "inicio": "2000-11-01", "mlt_diseno": 10.5},
+    "Aqua":   {"familia": "MODIS", "inicio": "2002-07-03", "mlt_diseno": 13.5},
+    "SNPP":   {"familia": "VIIRS", "inicio": "2012-01-20", "mlt_diseno": 13.5},
+    "NOAA20": {"familia": "VIIRS", "inicio": "2018-04-01", "mlt_diseno": 13.5},
+    "NOAA21": {"familia": "VIIRS", "inicio": "2024-01-17", "mlt_diseno": 13.5},
+}
+FIN_SNPP = pd.Timestamp("2026-10-31")  # fin anunciado de la distribución de S-NPP
+
+UMBRAL_MLT = 0.25    # horas: tolerancia para considerar "estable" a un sensor MODIS
+Z_CRITICO = 1.5      # anomalía (z) a partir de la cual un día es "crítico"
+MIN_DIAS_CRITICO = 5 # días consecutivos para declarar un periodo crítico
+
+FIRMS_BASE = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
+# (fuente FIRMS sin sufijo, sensor fijo o None si la fuente mezcla Terra+Aqua)
+FIRMS_FUENTES = [("MODIS", None), ("VIIRS_SNPP", "SNPP"),
+                 ("VIIRS_NOAA20", "NOAA20"), ("VIIRS_NOAA21", "NOAA21")]
+NORAD = {"Terra": 25994, "Aqua": 27424, "SNPP": 37849, "NOAA20": 43013, "NOAA21": 54234}
+
+
+# DATOS SINTÉTICOS (para el modo demo)
+# SUPUESTOS del demo (no es data real):
+#  - Ciclo diurno del fuego con pico ~15:30 hora local y ancho ~2.5 h.
+#  - VIIRS (375 m) detecta 3x más focos que MODIS (1 km).
+#  - Curvas de hora local ancladas en fechas publicadas por NASA: Aqua deriva
+#    desde 2021 (~13:45 en feb-2023, ~15:50 hacia ago-2026); Terra ~10:30 hasta
+#    feb-2020 y ~9:00 proyectado para 2026. Interpolación lineal entre anclas.
+_MLT_PUNTOS = {
+    "Terra": ([2000.8, 2020.15, 2026.1], [10.5, 10.5, 9.0]),
+    "Aqua":  ([2002.5, 2021.5, 2023.1, 2026.6], [13.5, 13.5, 13.75, 15.83]),
 }
 
 
-def format_bbox(bbox):
-    return ",".join(f"{value:.4f}" for value in bbox)
+def perfil_diurno(h):
+    """Actividad relativa del fuego según la hora local (supuesto del demo)."""
+    d = np.abs(((np.asarray(h, dtype=np.float64) - 15.5 + 12) % 24) - 12)
+    return 0.06 + np.exp(-0.5 * (d / 2.5) ** 2)
 
 
-def validar_bbox(raw_bbox):
-    if raw_bbox is None:
-        raise ValueError("Selecciona un BBOX válido.")
-    txt = str(raw_bbox).strip()
-    if not txt:
-        raise ValueError("El BBOX no puede estar vacío.")
-    parts = [p.strip() for p in txt.split(",")]
-    if len(parts) != 4:
-        raise ValueError("El BBOX debe tener 4 valores: O, S, E, N.")
-    try:
-        west, south, east, north = [float(p) for p in parts]
-    except ValueError as exc:
-        raise ValueError("El BBOX debe contener solo números.") from exc
-
-    if not (-180 <= west <= 180 and -180 <= east <= 180):
-        raise ValueError("Las longitudes deben estar entre -180 y 180.")
-    if not (-90 <= south <= 90 and -90 <= north <= 90):
-        raise ValueError("Las latitudes deben estar entre -90 y 90.")
-    if south >= north:
-        raise ValueError("La latitud sur debe ser menor que la de norte.")
-    if west >= east:
-        raise ValueError(
-            "La longitud oeste debe ser menor que la de este. Si cruza el antimeridiano, requiere tratamiento especial."
-        )
-    return (west, south, east, north)
+def año_decimal(fechas):
+    f = pd.DatetimeIndex(fechas)
+    return np.asarray(f.year + (f.dayofyear - 1) / 365.25, float)
 
 
-def aplicar_region(region_name):
-    if region_name in (None, "Personalizada"):
-        return st.session_state.get("bbox_text", "")
-    bbox = REGIONES_PREDEFINIDAS[region_name]
-    if bbox is None:
-        return st.session_state.get("bbox_text", "")
-    return format_bbox(bbox)
+def mlt_simulado(sensor, años):
+    if sensor in _MLT_PUNTOS:
+        xs, ys = _MLT_PUNTOS[sensor]
+        return np.interp(años, xs, ys)
+    return np.full(len(años), SENSORES[sensor]["mlt_diseno"], float)
 
 
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
+def simular(inicio, fin, bbox, semilla=42):
+    """Devuelve (detecciones sintéticas, serie 'verdad' de actividad real)."""
+    rng = np.random.default_rng(semilla)
+    fechas = pd.date_range(inicio, fin, freq="D")
+    doy = fechas.dayofyear.values
+    dist = np.abs(doy - 245)
+    dist = np.minimum(dist, 365 - dist)
+    estacional = 0.03 + np.exp(-0.5 * (dist / 35.0) ** 2)      # pico ~ septiembre
+    anual = {int(a): rng.lognormal(0, 0.35) for a in fechas.year.unique()}
+    for a, f in {2010: 2.5, 2019: 3.0, 2024: 3.5}.items():       # años extremos
+        if a in anual:
+            anual[a] *= f
+    f_anual = np.array([anual[int(a)] for a in fechas.year])
+    ruido = pd.Series(rng.lognormal(0, 0.7, len(fechas))).rolling(5, min_periods=1).mean().values
+    verdad = pd.Series(30.0 * estacional * f_anual * ruido, index=fechas, name="verdad")
 
-    :root {
-        --ink: #1c2924;
-        --forest: #173a31;
-        --moss: #dce8d8;
-        --paper: #f4f5ef;
-        --line: #dce2d8;
-        --muted: #68766e;
-        --signal: #df633e;
-        --signal-light: #fff0e9;
-    }
-    html, body, [class*="css"] {
-        font-family: 'Manrope', 'Segoe UI', sans-serif;
-        color: var(--ink);
-    }
-    [data-testid="stAppViewContainer"] {
-        background-color: var(--paper);
-        background-image: repeating-linear-gradient(135deg, rgba(23,58,49,.025) 0, rgba(23,58,49,.025) 1px, transparent 1px, transparent 10px);
-    }
-    [data-testid="stHeader"] { background: transparent; }
-    [data-testid="stMainBlockContainer"] { max-width: 1440px; padding-top: 2.2rem; }
-    [data-testid="stSidebar"] > div:first-child {
-        background: var(--forest);
-        border-right: 1px solid rgba(255,255,255,.12);
-    }
-    [data-testid="stSidebar"] * { color: #eff3e9; }
-    [data-testid="stSidebar"] [data-baseweb="input"] input,
-    [data-testid="stSidebar"] [data-baseweb="select"] > div,
-    [data-testid="stSidebar"] [data-testid="stDateInput"] input {
-        background: #24483e;
-        border-color: #48675d;
-        color: #fff;
-    }
-    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
-        color: #c5d2c8;
-        font-size: .78rem;
-        font-weight: 700;
-    }
-    [data-testid="stMetric"] {
-        background: rgba(255,255,255,.82);
-        border: 1px solid var(--line);
-        border-top: 3px solid #9aad9c;
-        border-radius: 5px;
-        padding: 15px 18px;
-        min-height: 112px;
-    }
-    [data-testid="stMetric"] label p {
-        color: var(--muted);
-        font-size: .75rem;
-        font-weight: 700;
-        text-transform: uppercase;
-    }
-    [data-testid="stMetricValue"] { color: var(--ink); font-weight: 800; }
-    .hero {
-        position: relative;
-        overflow: hidden;
-        background: var(--forest);
-        color: #f7f8f1;
-        border-radius: 5px;
-        padding: 30px 34px 27px;
-        margin-bottom: 22px;
-        border-bottom: 4px solid var(--signal);
-    }
-    .hero:after {
-        content: '';
-        position: absolute;
-        right: 0; top: 0; bottom: 0; width: 34%;
-        opacity: .19;
-        background: repeating-linear-gradient(135deg, transparent 0 12px, #dce8d8 12px 13px);
-        mask-image: linear-gradient(90deg, transparent, black);
-        pointer-events: none;
-    }
-    .eyebrow, .micro, .side-mark {
-        font-family: 'DM Mono', Consolas, monospace;
-        letter-spacing: .04em;
-        text-transform: uppercase;
-    }
-    .eyebrow { color: #c4d8c5; font-size: .72rem; margin-bottom: 8px; }
-    .hero-title { font-size: clamp(1.8rem, 3vw, 2.65rem); font-weight: 800; line-height: 1.08; }
-    .hero-meta { color: #d1ddd3; font-size: .84rem; margin-top: 13px; }
-    .side-mark { color: #b4c8b9; font-size: .68rem; margin: 4px 0 23px; }
-    .section-heading {
-        color: var(--forest);
-        font-size: 1.06rem;
-        font-weight: 800;
-        margin: 4px 0 2px;
-    }
-    .section-rule { border-top: 1px solid var(--line); margin: 12px 0 18px; }
-    [data-testid="stTabs"] [data-baseweb="tab-list"] { gap: 7px; }
-    [data-testid="stTabs"] button[role="tab"] {
-        color: var(--muted);
-        font-weight: 700;
-        border-radius: 4px 4px 0 0;
-    }
-    [data-testid="stTabs"] button[aria-selected="true"] {
-        color: var(--forest);
-        border-bottom-color: var(--signal);
-    }
-    div.stButton > button[kind="primary"] {
-        background: var(--signal);
-        border: 1px solid var(--signal);
-        color: white;
-        border-radius: 4px;
-        font-weight: 800;
-        min-height: 44px;
-    }
-    div.stButton > button[kind="primary"]:hover { background: #c94f2e; border-color: #c94f2e; }
-    .empty-state {
-        border: 1px dashed #b8c6b9;
-        background: rgba(255,255,255,.62);
-        border-radius: 5px;
-        padding: 36px;
-        color: var(--muted);
-        text-align: center;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.session_state.setdefault("bbox_text", "-56.5502,-33.3985,-56.4950,-33.3520")
-st.session_state.setdefault("selected_region", "Uruguay")
+    W, S, E, N = bbox
+    filas = []
+    for sensor, cfg in SENSORES.items():
+        msk = fechas >= pd.Timestamp(cfg["inicio"])
+        if sensor == "SNPP":
+            msk &= fechas <= FIN_SNPP
+        idx = np.where(msk)[0]
+        if len(idx) == 0:
+            continue
+        mlt = mlt_simulado(sensor, año_decimal(fechas[idx]))
+        sens = 1.0 if cfg["familia"] == "MODIS" else 3.0
+        for noche, off in ((False, 0.0), (True, 12.0)):          # paso diurno y nocturno
+            lam = verdad.values[idx] * sens * perfil_diurno((mlt + off) % 24)
+            k = rng.poisson(lam)
+            if k.sum() == 0:
+                continue
+            pos = np.repeat(np.arange(len(idx)), k)
+            hl = (mlt[pos] + off + rng.normal(0, 0.4, len(pos))) % 24   # hora local
+            lon = rng.uniform(W, E, len(pos))
+            lat = rng.uniform(S, N, len(pos))
+            filas.append(pd.DataFrame({
+                "fecha": fechas[idx][pos], "hora_utc": (hl - lon / 15.0) % 24,
+                "lat": lat, "lon": lon, "sensor": sensor, "familia": cfg["familia"],
+                "conf_ok": rng.random(len(pos)) < 0.85,
+                "frp": rng.gamma(2.0, 8.0, len(pos)), "diurno": not noche}))
+    return pd.concat(filas, ignore_index=True), verdad
 
 
-with st.sidebar:
-    st.markdown("<div class='side-mark'>FIRE / OBSERVATION / 01</div>", unsafe_allow_html=True)
-    st.markdown("### Paso 1 · Configurar NASA FIRMS")
-    st.caption("NASA FIRMS requiere una MAP_KEY para consultar focos activos de MODIS y VIIRS.")
-    st.link_button("Obtener mi NASA FIRMS API Key (Gratis)", "https://firms.modaps.eosdis.nasa.gov/api/map_key/")
+# 2. DATOS REALES (FIRMS)
 
-    with st.expander("¿Cómo obtener mi API Key?", expanded=False):
-        st.markdown(
-            """
-            1. Entrá a la página oficial de NASA FIRMS.\n
-            2. Ingresá tu correo electrónico.\n
-            3. Solicitá la clave MAP_KEY gratuita.\n
-            4. Revisá tu correo para obtener la clave.\n
-            5. Pegala en el campo correcto.\n
-            La clave solo se usa para consultar los datos y no se comparte en la aplicación.
-            """
-        )
-
-    with st.form("consulta_firms"):
-        key = st.text_input("FIRMS MAP_KEY", type="password", key="map_key_input")
-        st.caption("Se mantiene solo durante la sesión actual.")
-
-        st.markdown("### Paso 2 · Seleccionar región")
-        regiones = list(REGIONES_PREDEFINIDAS.keys())
-        region_choice = st.selectbox(
-            "Región predefinida",
-            regiones,
-            index=regiones.index(st.session_state.get("selected_region", "Uruguay")),
-            key="region_select",
-        )
-        if region_choice != "Personalizada":
-            st.session_state["bbox_text"] = aplicar_region(region_choice)
-        st.session_state["selected_region"] = region_choice
-
-        with st.expander("¿Qué es un BBOX y cómo funciona?", expanded=False):
-            st.markdown(
-                """
-                Un BBOX (Bounding Box) es un rectángulo geográfico que delimita la zona de análisis.\n
-                NASA FIRMS usa cuatro valores en este orden: OESTE, SUR, ESTE, NORTE.\n
-                Ejemplo aproximado para Uruguay: `-58.5,-35.2,-53,-30`\n
-                - Oeste: límite occidental\n
-                - Sur: latitud mínima\n
-                - Este: límite oriental\n
-                - Norte: latitud máxima\n
-                El rectángulo se forma con esos cuatro límites.
-                """
-            )
-
-        bbox_text = st.text_input(
-            "BBox · O, S, E, N",
-            st.session_state["bbox_text"],
-            help="Formato esperado: oeste,sur,este,norte",
-            key="bbox_input",
-        )
-        st.session_state["bbox_text"] = bbox_text
-
+def _get(url, reintentos=3):
+    for i in range(reintentos):
         try:
-            validar_bbox(bbox_text)
-            st.success("BBox válido para NASA FIRMS.")
-        except ValueError as exc:
-            st.warning(str(exc))
+            with urllib.request.urlopen(url, timeout=60) as r:
+                return r.read().decode("utf-8", "replace")
+        except Exception:
+            time.sleep(2 * (i + 1))
+    return None  # (no se imprime la URL para no exponer la MAP_KEY)
 
-        inicio = st.date_input("Fecha inicial", date(2023, 1, 1), key="inicio_input")
-        fin = st.date_input("Fecha final", date(2023, 12, 30), key="fin_input")
 
-        ejecutar = st.form_submit_button("Consultar FIRMS", type="primary", use_container_width=True)
-        if ejecutar:
-            try:
-                parsed_bbox = validar_bbox(bbox_text)
-                if not key:
-                    st.session_state["dashboard_error"] = "Ingresa tu MAP_KEY de FIRMS."
-                elif inicio > fin:
-                    st.session_state["dashboard_error"] = "La fecha inicial debe ser anterior a la final."
-                else:
-                    with st.spinner("Consultando detecciones satelitales…"):
-                        det = core.descargar_firms(key, parsed_bbox, inicio.isoformat(), fin.isoformat())
-                        mlt = core.mlt_empirico(det)
-                        conteos = core.conteos_diarios(det)
-                        indice, _, _, _, _ = core.armonizar(conteos, mlt)
-                        matriz = core.matriz_anual(indice.rolling(7, min_periods=4, center=True).mean())
-                        z, valores = core.anomalias(matriz)
-                        criticos = core.periodos_criticos(z, valores, matriz.index.values)
-                    st.session_state["dashboard"] = {
-                        "detecciones": det,
-                        "conteos": conteos,
-                        "indice": indice,
-                        "mlt": mlt,
-                        "criticos": criticos,
-                        "bbox": parsed_bbox,
-                        "inicio": inicio,
-                        "fin": fin,
-                    }
-                    st.session_state.pop("dashboard_error", None)
-            except ValueError as exc:
-                st.session_state["dashboard_error"] = str(exc)
-            except SystemExit as exc:
-                st.session_state["dashboard_error"] = str(exc)
-            except Exception as exc:
-                st.session_state["dashboard_error"] = f"No se pudieron procesar los datos: {exc}"
-
-st.markdown(
-    """
-    <div class='hero'>
-        <div class='eyebrow'>Observatorio de actividad · FIRMS</div>
-        <div class='hero-title'>Fuego visto desde<br>órbita.</div>
-        <div class='hero-meta'>MODIS + VIIRS &nbsp; / &nbsp; análisis satelital de alto valor para monitoreo ambiental</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-if "dashboard_error" in st.session_state:
-    st.error(st.session_state["dashboard_error"])
-
-with st.expander("Generador visual de BBOX dentro de la página", expanded=True):
-    if folium is None or st_folium is None:
-        st.info("Para habilitar el mapa interactivo, instala folium y streamlit-folium en el entorno.")
+def normalizar_firms(raw, sensor_fijo):
+    """Convierte un CSV de FIRMS al esquema común del piloto."""
+    t = pd.to_numeric(raw["acq_time"], errors="coerce").fillna(0).astype(int)
+    if sensor_fijo is None:  # MODIS: Terra y Aqua vienen mezclados
+        sat = raw["satellite"].astype(str).str.lower().str[0]
+        sensor = np.where(sat == "t", "Terra", "Aqua")
     else:
-        mapa = folium.Map(location=[-30, -60], zoom_start=3, tiles="CartoDB positron")
-        draw = Draw(
-            export=False,
-            draw_options={
-                "polyline": False,
-                "polygon": False,
-                "circle": False,
-                "marker": False,
-                "circlemarker": False,
-                "rectangle": True,
-                "poly": False,
-            },
-            edit_options={"edit": True, "remove": True},
-        )
-        draw.add_to(mapa)
+        sensor = np.full(len(raw), sensor_fijo, dtype=object)
+    conf = raw["confidence"]
+    num = pd.to_numeric(conf, errors="coerce")
+    # MODIS: 0-100 (>=30 nominal/alta). VIIRS: l/n/h (se conservan n y h).
+    ok = np.where(num.notna(), num >= 30,
+                  conf.astype(str).str.lower().isin(["n", "h", "nominal", "high"]))
+    if "type" in raw:                                  # solo vegetación (type == 0)
+        ok = ok & (pd.to_numeric(raw["type"], errors="coerce") == 0).values
+    out = pd.DataFrame({
+        "fecha": pd.to_datetime(raw["acq_date"]).values,
+        "hora_utc": (t // 100 + (t % 100) / 60.0).values,
+        "lat": raw["latitude"].values, "lon": raw["longitude"].values,
+        "sensor": sensor,
+        "conf_ok": ok,
+        "frp": raw["frp"].values if "frp" in raw else np.nan,
+        "diurno": raw["daynight"].astype(str).str.upper().eq("D").values})
+    out["familia"] = out["sensor"].map(lambda s: SENSORES[s]["familia"])
+    return out
 
-        current_bbox = st.session_state.get("bbox_text", "")
-        try:
-            west, south, east, north = validar_bbox(current_bbox)
-            folium.Rectangle(bounds=[[south, west], [north, east]], color="#df633e", fill=True, fill_opacity=0.2).add_to(mapa)
-            mapa.fit_bounds([[south, west], [north, east]])
-        except ValueError:
-            pass
 
-        map_output = st_folium(mapa, width=900, height=430, key="bbox_map")
-        if map_output and map_output.get("last_active_drawing"):
-            drawing = map_output["last_active_drawing"]
-            if drawing.get("type") == "rectangle":
-                bounds = drawing.get("bounds")
-                if bounds:
-                    all_lats = [float(bounds[0][0]), float(bounds[1][0])]
-                    all_lngs = [float(bounds[0][1]), float(bounds[1][1])]
-                    west = min(all_lngs)
-                    east = max(all_lngs)
-                    south = min(all_lats)
-                    north = max(all_lats)
-                    st.session_state["bbox_text"] = f"{west},{south},{east},{north}"
-                    st.rerun()
+def descargar_firms(map_key, bbox, inicio, fin, cache="cache_firms"):
+    """Descarga por tramos de 5 días y guarda en caché (la API limita el rango)."""
+    W, S, E, N = bbox
+    cache = Path(cache)
+    cache.mkdir(parents=True, exist_ok=True)
+    hoy = pd.Timestamp.today().normalize()
+    fin = pd.Timestamp(fin)
+    frames = []
+    for fuente, sensor_fijo in FIRMS_FUENTES:
+        ini_sensor = pd.Timestamp(SENSORES[sensor_fijo or "Terra"]["inicio"])
+        for d0 in pd.date_range(inicio, fin, freq="5D"):
+            dias = int(min(5, (fin - d0).days + 1))
+            d1 = d0 + pd.Timedelta(days=dias - 1)
+            if d1 < ini_sensor:
+                continue
+            if fuente == "VIIRS_SNPP" and d0 > FIN_SNPP:
+                continue
+            f_cache = cache / f"{fuente}_{d0:%Y%m%d}_{dias}d_{W}_{S}_{E}_{N}.csv"
+            raw = None
+            if f_cache.exists():
+                try:
+                    raw = pd.read_csv(f_cache)
+                except pd.errors.EmptyDataError:
+                    pass
+            if raw is None:
+                orden = ["NRT", "SP"] if d0 > hoy - pd.Timedelta(days=90) else ["SP", "NRT"]
+                raw = pd.DataFrame()
+                for suf in orden:
+                    url = f"{FIRMS_BASE}/{map_key}/{fuente}_{suf}/{W},{S},{E},{N}/{dias}/{d0:%Y-%m-%d}"
+                    txt = _get(url)
+                    if txt and txt.lstrip().startswith("latitude"):
+                        raw = pd.read_csv(io.StringIO(txt))
+                        if len(raw):
+                            break
+                    elif txt:
+                        print(f"  ! respuesta inesperada de {fuente}_{suf}: {txt[:80]!r}", file=sys.stderr)
+                if d1 < hoy - pd.Timedelta(days=3) and len(raw.columns):
+                    raw.to_csv(f_cache, index=False)
+            if len(raw):
+                frames.append(normalizar_firms(raw, sensor_fijo))
+        print(f"  {fuente}: listo")
+    if not frames:
+        sys.exit("No se descargó ningún foco. Revisa MAP_KEY, bbox y fechas.")
+    det = pd.concat(frames, ignore_index=True)
+    # MODIS trae Terra+Aqua en la misma fuente: sensores que no existan aún se descartan
+    return det
 
-        if st.button("Limpiar selección", use_container_width=True):
-            st.session_state["bbox_text"] = ""
-            st.rerun()
 
-if "dashboard" in st.session_state:
-    data = st.session_state["dashboard"]
-    bbox_label = ", ".join(f"{value:.4f}" for value in data["bbox"])
-    st.markdown(
-        f"<div class='hero'><div class='eyebrow'>Observatorio de actividad · FIRMS</div>"
-        f"<div class='hero-title'>Fuego visto desde<br>órbita.</div>"
-        f"<div class='hero-meta'>{data['inicio']:%d %b %Y} — {data['fin']:%d %b %Y}"
-        f" &nbsp; / &nbsp; bbox {bbox_label}</div></div>",
-        unsafe_allow_html=True,
-    )
 
-    detecciones = data["detecciones"]
-    conteos = data["conteos"]
-    criticos = data["criticos"]
-    total = len(detecciones)
-    confirmadas = int(detecciones["conf_ok"].sum())
-    dias_activos = int(conteos.sum(axis=1).gt(0).sum())
-    dias_totales = len(conteos.index)
+# 3. ANÁLISIS
+def mlt_empirico(det, min_n=30):
+    """Hora solar local mediana de las detecciones DIURNAS, por trimestre y sensor.
+    (Aproximación: depende algo de la latitud y del borde del barrido.)"""
+    d = det[det["diurno"]].copy()
+    d["hl"] = (d["hora_utc"] + d["lon"] / 15.0) % 24
+    d["trim"] = d["fecha"].dt.to_period("Q").dt.start_time
+    g = d.groupby(["trim", "sensor"])["hl"]
+    med = g.median().where(g.size() >= min_n).unstack("sensor")
+    return med.rolling(3, center=True, min_periods=1).mean()
 
-    metricas = st.columns(4)
-    metricas[0].metric("Detecciones", f"{total:,}")
-    metricas[1].metric("Confianza aceptada", f"{confirmadas:,}")
-    metricas[2].metric("Días con actividad", f"{dias_activos:,}", f"de {dias_totales} días")
-    metricas[3].metric("Periodos críticos", f"{len(criticos):,}")
 
-    st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
-    mapa_tab, actividad_tab, sensores_tab, eventos_tab = st.tabs(["Mapa", "Actividad", "Satélites", "Periodos críticos"])
+def conteos_diarios(det):
+    d = det[det["conf_ok"]]
+    rango = pd.date_range(det["fecha"].min(), det["fecha"].max(), freq="D")
+    c = d.groupby(["fecha", "sensor"]).size().unstack("sensor").reindex(rango).fillna(0.0)
+    for s in c.columns:
+        c.loc[c.index < pd.Timestamp(SENSORES[s]["inicio"]), s] = np.nan
+    if "SNPP" in c:
+        c.loc[c.index > FIN_SNPP, "SNPP"] = np.nan
+    return c
 
-    with mapa_tab:
-        st.markdown("<div class='section-heading'>Distribución espacial</div>", unsafe_allow_html=True)
-        puntos = detecciones.loc[:, ["lat", "lon"]].dropna()
-        if len(puntos) > 5000:
-            puntos = puntos.sample(5000, random_state=42)
-        st.map(puntos, latitude="lat", longitude="lon", zoom=7, size=12, color="#df633e")
-        if len(detecciones) > len(puntos):
-            st.caption(f"Mapa de una muestra de {len(puntos):,} detecciones para mantenerlo ágil.")
 
-    with actividad_tab:
-        st.markdown("<div class='section-heading'>Evolución de detecciones</div>", unsafe_allow_html=True)
-        st.line_chart(conteos, height=340, use_container_width=True)
-        st.markdown("<div class='section-heading'>Índice armonizado</div>", unsafe_allow_html=True)
-        st.line_chart(data["indice"].rename("Índice equivalente a VIIRS"), height=280, use_container_width=True)
+def armonizar(c, mlt_emp, tol=UMBRAL_MLT):
+    """Índice 'equivalente a VIIRS'.
+    - Referencia: promedio de los VIIRS disponibles cada día.
+    - MODIS: se escala a VIIRS con un factor k calculado en los días en que el
+      sensor estaba estable (|MLT - MLT de diseño| <= tol) y VIIRS existía.
+    - Antes de VIIRS se usa MODIS estable x k; después, VIIRS."""
+    viirs = [s for s in c.columns if SENSORES[s]["familia"] == "VIIRS"]
+    modis = [s for s in c.columns if SENSORES[s]["familia"] == "MODIS"]
+    ref = c[viirs].mean(axis=1, skipna=True) if viirs else pd.Series(np.nan, index=c.index)
 
-    with sensores_tab:
-        izquierda, derecha = st.columns([1.2, 1])
-        with izquierda:
-            st.markdown("<div class='section-heading'>Detecciones por sensor</div>", unsafe_allow_html=True)
-            totales = conteos.sum().sort_values(ascending=False).rename("Detecciones")
-            st.bar_chart(totales, height=300, use_container_width=True)
-        with derecha:
-            st.markdown("<div class='section-heading'>Hora local estimada</div>", unsafe_allow_html=True)
-            st.line_chart(data["mlt"], height=300, use_container_width=True)
-
-    with eventos_tab:
-        st.markdown("<div class='section-heading'>Anomalías persistentes detectadas</div>", unsafe_allow_html=True)
-        if criticos.empty:
-            st.info("No se detectaron periodos críticos para el intervalo seleccionado.")
+    estable, k = {}, {}
+    for s in modis:
+        if s in mlt_emp:
+            m = mlt_emp[s].dropna()
+            m.index = pd.DatetimeIndex(m.index) + pd.Timedelta(days=45)   # centro del trimestre
+            md = (m.reindex(m.index.union(c.index)).interpolate("time", limit_direction="both")
+                  .reindex(c.index))
+            estable[s] = (md - SENSORES[s]["mlt_diseno"]).abs() <= tol
         else:
-            st.dataframe(criticos, hide_index=True, use_container_width=True)
-else:
-    st.markdown(
-        "<div class='empty-state'><span class='micro'>Sin consulta activa</span></div>",
-        unsafe_allow_html=True,
-    )
+            estable[s] = pd.Series(False, index=c.index)
+        m_cal = estable[s] & ref.notna() & c[s].notna()
+        den = c.loc[m_cal, s].sum()
+        k[s] = ref[m_cal].sum() / den if den > 0 else np.nan
+
+    eq = pd.DataFrame({s: c[s] * k[s] for s in modis}, index=c.index)       # sin máscara
+    eq_est = pd.DataFrame({s: eq[s].where(estable[s]) for s in modis}, index=c.index)
+    modis_eq = eq_est.mean(axis=1, skipna=True) if modis else pd.Series(np.nan, index=c.index)
+    indice = ref.where(ref.notna(), modis_eq)
+    fuente = np.where(ref.notna(), "VIIRS", np.where(modis_eq.notna(), "MODIS-estable", "sin dato"))
+    return indice, fuente, k, ref, eq
+
+
+def matriz_anual(serie):
+    df = pd.DataFrame({"a": serie.index.year, "d": serie.index.dayofyear, "v": serie.values})
+    return df.pivot(index="a", columns="d", values="v").reindex(columns=range(1, 367))
+
+
+def _suave_circular(v, w=15):
+    h = w // 2
+    ext = np.concatenate([v[-h:], v, v[:h]])
+    return pd.Series(ext).rolling(w, center=True, min_periods=1).mean().values[h:-h]
+
+
+def anomalias(M):
+    """z-score del log(1+índice) respecto a la climatología por día del año."""
+    X = np.log1p(M.values)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mu = _suave_circular(pd.Series(np.nanmean(X, axis=0)).bfill().ffill().values)
+        sd = np.maximum(_suave_circular(pd.Series(np.nanstd(X, axis=0)).bfill().ffill().values), 0.25)
+    return (X - mu) / sd, X
+
+
+def periodos_criticos(z, X, años):
+    """Rachas de >= MIN_DIAS_CRITICO días con z >= Z_CRITICO y actividad sobre la mediana."""
+    piso = np.nanmedian(X)
+    filas = []
+    for i, a in enumerate(años):
+        crit = (np.nan_to_num(z[i], nan=-9) >= Z_CRITICO) & (np.nan_to_num(X[i], nan=-9) >= piso)
+        j = 0
+        while j < len(crit):
+            if crit[j]:
+                k = j
+                while k + 1 < len(crit) and crit[k + 1]:
+                    k += 1
+                if k - j + 1 >= MIN_DIAS_CRITICO:
+                    ini = pd.Timestamp(f"{int(a)}-01-01") + pd.Timedelta(days=j)
+                    filas.append({"año": int(a), "inicio": ini.date(),
+                                  "fin": (ini + pd.Timedelta(days=k - j)).date(),
+                                  "dias": k - j + 1, "z_max": round(float(np.nanmax(z[i, j:k + 1])), 2)})
+                j = k + 1
+            else:
+                j += 1
+    return pd.DataFrame(filas)
+
+
+# 4. GRÁFICOS
+COLORES = {"Terra": "#2a9d8f", "Aqua": "#e76f51", "SNPP": "#264653", "NOAA20": "#6a4c93", "NOAA21": "#e9c46a"}
+
+
+def graf_mlt(mlt_emp, ruta):
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    for s in mlt_emp.columns:
+        ax.plot(mlt_emp.index, mlt_emp[s], label=s, color=COLORES.get(s), lw=1.8)
+        ax.axhline(SENSORES[s]["mlt_diseno"], color=COLORES.get(s), ls=":", lw=0.8)
+    ax.set_ylabel("Hora solar local del paso diurno (h)")
+    ax.set_title("Deriva de hora local estimada desde las detecciones (puntos = hora de diseño)")
+    ax.grid(alpha=0.3)
+    ax.legend(ncol=5, loc="upper center", frameon=False)
+    fig.tight_layout()
+    fig.savefig(ruta, dpi=140)
+    plt.close(fig)
+
+
+def graf_sesgo(eq, ref, ruta):
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    for s in eq.columns:
+        r = eq[s].rolling(90, min_periods=60).sum() / ref.rolling(90, min_periods=60).sum()
+        ax.plot(r.index, r, label=f"{s} (x k) / VIIRS", color=COLORES.get(s), lw=1.8)
+    ax.axhline(1.0, color="k", lw=1)
+    ax.set_ylabel("Cociente (ventana 90 días)")
+    ax.set_title("Sesgo de MODIS respecto a VIIRS: 1.0 = comparable")
+    ax.grid(alpha=0.3)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(ruta, dpi=140)
+    plt.close(fig)
+
+
+def graf_calendario(M, z, X, ruta):
+    años = M.index.values
+    meses = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+    nombres = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+    fig, axs = plt.subplots(2, 1, figsize=(11, 0.34 * len(años) * 2 + 3), sharex=True)
+    cm1 = plt.get_cmap("YlOrRd").copy(); cm1.set_bad("#e6e6e6")
+    cm2 = plt.get_cmap("RdBu_r").copy(); cm2.set_bad("#e6e6e6")
+    im1 = axs[0].imshow(np.ma.masked_invalid(X), aspect="auto", cmap=cm1, interpolation="nearest")
+    im2 = axs[1].imshow(np.ma.masked_invalid(z), aspect="auto", cmap=cm2, vmin=-3, vmax=3, interpolation="nearest")
+    crit = np.nan_to_num(z, nan=-9) >= Z_CRITICO
+    if crit.any():
+        axs[1].contour(crit.astype(float), levels=[0.5], colors="k", linewidths=0.5)
+    axs[0].set_title("Índice armonizado (equivalente a VIIRS), log(1 + focos/día, suavizado 7 d)")
+    axs[1].set_title(f"Anomalía respecto a la climatología (contorno: z ≥ {Z_CRITICO})")
+    for ax, im in zip(axs, (im1, im2)):
+        ax.set_yticks(range(0, len(años), 2)); ax.set_yticklabels(años[::2])
+        fig.colorbar(im, ax=ax, fraction=0.02, pad=0.01)
+    axs[1].set_xticks([m - 1 for m in meses]); axs[1].set_xticklabels(nombres)
+    fig.tight_layout()
+    fig.savefig(ruta, dpi=140)
+    plt.close(fig)
+
+
+# 5. ÓRBITAS (TLE -> hora local del nodo)
+def parsear_tles(texto):
+    lineas = [l.rstrip() for l in texto.splitlines() if l.strip()]
+    return [(lineas[i], lineas[i + 1]) for i in range(len(lineas) - 1)
+            if lineas[i].startswith("1 ") and lineas[i + 1].startswith("2 ")]
+
+
+def hora_local_nodo(l1, l2):
+    """Hora solar media local del nodo ascendente (LTAN) y del paso diurno.
+    LTAN = 12 h + (RAAN - longitud media del Sol)/15. Precisión ~ minutos."""
+    yy, dia = int(l1[18:20]), float(l1[20:32])
+    epoca = datetime(2000 + yy if yy < 57 else 1900 + yy, 1, 1) + timedelta(days=dia - 1)
+    d = (epoca - datetime(2000, 1, 1, 12)).total_seconds() / 86400.0   # días desde J2000
+    raan = float(l2[17:25])
+    L_sol = (280.460 + 0.9856474 * d) % 360.0                          # Sol medio
+    ltan = (12.0 + (raan - L_sol) / 15.0) % 24.0
+    diurno = ltan if 6 <= ltan < 18 else (ltan + 12.0) % 24.0
+    return epoca, ltan, diurno
+
+
+def modo_orbitas(args):
+    salida = Path(args.salida); salida.mkdir(parents=True, exist_ok=True)
+    if args.tle_file:
+        pares = parsear_tles(Path(args.tle_file).read_text())
+        filas = [dict(epoca=e, ltan_h=round(a, 3), paso_diurno_h=round(b, 3))
+                 for e, a, b in (hora_local_nodo(*p) for p in pares)]
+        df = pd.DataFrame(filas).sort_values("epoca")
+        df.to_csv(salida / f"mlt_tle_{args.sat}.csv", index=False)
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(df["epoca"], df["paso_diurno_h"], color=COLORES.get(args.sat, "C0"))
+        if args.sat in SENSORES:
+            ax.axhline(SENSORES[args.sat]["mlt_diseno"], color="k", ls=":")
+        ax.set_ylabel("Hora local del paso diurno (h)"); ax.grid(alpha=0.3)
+        ax.set_title(f"{args.sat}: hora local desde TLE históricos")
+        fig.tight_layout(); fig.savefig(salida / f"04_mlt_tle_{args.sat}.png", dpi=140)
+        print(df.tail(10).to_string(index=False))
+        return
+    filas = []
+    for nombre, cat in NORAD.items():
+        txt = _get(f"https://celestrak.org/NORAD/elements/gp.php?CATNR={cat}&FORMAT=tle")
+        pares = parsear_tles(txt) if txt else []
+        if not pares:
+            print(f"  ! sin TLE para {nombre}", file=sys.stderr)
+            continue
+        e, ltan, dia = hora_local_nodo(*pares[0])
+        filas.append(dict(satelite=nombre, epoca=e.strftime("%Y-%m-%d"),
+                          ltan_h=round(ltan, 2), paso_diurno_h=round(dia, 2),
+                          desviacion_vs_diseno_h=round(dia - SENSORES[nombre]["mlt_diseno"], 2)))
+    df = pd.DataFrame(filas)
+    df.to_csv(salida / "orbitas_actuales.csv", index=False)
+    print(df.to_string(index=False))
+
+
+# 6. PIPELINE
+def pipeline(det, salida, verdad=None):
+    salida = Path(salida); salida.mkdir(parents=True, exist_ok=True)
+    print(f"Detecciones: {len(det):,} | sensores: {sorted(det['sensor'].unique())}")
+
+    mlt_e = mlt_empirico(det)
+    graf_mlt(mlt_e, salida / "01_mlt_empirico.png")
+    ultimo = mlt_e.ffill().iloc[-1].round(2).to_dict()
+    print("Hora local (último trimestre con datos):", ultimo)
+
+    c = conteos_diarios(det)
+    indice, fuente, k, ref, eq = armonizar(c, mlt_e)
+    print("Factores de escala MODIS -> VIIRS (k):", {s: (round(float(v), 3) if v == v else None) for s, v in k.items()})
+    sin_k = [s for s, v in k.items() if v != v]
+    if sin_k:
+        print(f"  ! Sin calibración para {sin_k}: no hay días con MODIS estable y VIIRS a la vez en esta "
+              "ventana. MODIS queda fuera del índice; para calibrar incluye en el rango un periodo "
+              "~2012-2020 (órbitas estables).")
+    graf_sesgo(eq, ref, salida / "02_sesgo_modis_vs_viirs.png")
+
+    S = indice.rolling(7, min_periods=4, center=True).mean()
+    M = matriz_anual(S)
+    z, X = anomalias(M)
+    graf_calendario(M, z, X, salida / "03_calendario_armonizado.png")
+
+    crit = periodos_criticos(z, X, M.index.values)
+    crit.to_csv(salida / "periodos_criticos.csv", index=False)
+    out = c.copy()
+    out["indice_armonizado"] = indice
+    out["fuente"] = fuente
+    out.to_csv(salida / "indice_armonizado.csv", index_label="fecha")
+    print(f"Periodos críticos detectados: {len(crit)} (ver periodos_criticos.csv)")
+    if len(crit):
+        print(crit.sort_values("z_max", ascending=False).head(8).to_string(index=False))
+
+    if verdad is not None:   # validación solo posible en el demo
+        print("\n--- VALIDACIÓN CONTRA LA VERDAD SIMULADA ---")
+        m30 = lambda s: s.rolling(30, min_periods=20).mean()
+        alin = pd.DataFrame({"idx": m30(indice), "ver": m30(verdad)}).dropna()
+        for nombre, sub in (("solo MODIS (antes de 2012)", alin[alin.index < "2012-01-20"]),
+                            ("VIIRS (2012 en adelante)", alin[alin.index >= "2012-01-20"])):
+            if len(sub) > 30:
+                print(f"  correlación índice vs. verdad, {nombre}: r = {sub['idx'].corr(sub['ver']):.3f}")
+        ult = pd.Timestamp(det["fecha"].max()) - pd.Timedelta(days=365)
+        for s in eq.columns:
+            num = eq[s][eq.index > ult].sum(); den = ref[ref.index > ult].sum()
+            print(f"  último año, {s}(x k)/VIIRS = {num / den:.2f}  (1.00 = sin sesgo)")
+        errs = []
+        for s in mlt_e.columns:
+            m = mlt_e[s].dropna()
+            sim = mlt_simulado(s, año_decimal(m.index + pd.Timedelta(days=45)))
+            errs.append(np.abs(m.values - sim).mean())
+        print(f"  error medio de la hora local empírica vs. la simulada: {np.mean(errs):.2f} h")
+    print(f"\nSalidas en: {salida.resolve()}")
+
+
+def parse_bbox(txt):
+    p = [float(x) for x in txt.split(",")]
+    if len(p) != 4:
+        raise argparse.ArgumentTypeError("bbox = W,S,E,N")
+    return tuple(p)
+
+
+def main():
+    comun = argparse.ArgumentParser(add_help=False)
+    comun.add_argument("--salida", default="salida")
+    ap = argparse.ArgumentParser(description="Piloto: calendario armonizado de incendios MODIS+VIIRS")
+    sub = ap.add_subparsers(dest="modo", required=True)
+
+    d = sub.add_parser("demo", parents=[comun], help="datos sintéticos, sin internet")
+    d.add_argument("--bbox", type=parse_bbox, default=parse_bbox("-62,-20,-55,-12"))
+    d.add_argument("--inicio", default="2000-11-01")
+    d.add_argument("--fin", default="2026-09-30")
+    d.add_argument("--semilla", type=int, default=42)
+
+    l = sub.add_parser("live", parents=[comun], help="datos reales de NASA FIRMS")
+    l.add_argument("--map-key", default=os.environ.get("FIRMS_MAP_KEY"))
+    l.add_argument("--bbox", type=parse_bbox, required=True, help="W,S,E,N (usa --bbox=-62,... si empieza con '-')")
+    l.add_argument("--inicio", required=True)
+    l.add_argument("--fin", required=True)
+    l.add_argument("--cache", default="cache_firms")
+
+    o = sub.add_parser("orbitas", parents=[comun], help="hora local de los satélites desde TLE")
+    o.add_argument("--tle-file")
+    o.add_argument("--sat", default="Aqua", choices=list(NORAD))
+
+    a = ap.parse_args()
+    if a.modo == "demo":
+        det, verdad = simular(a.inicio, a.fin, a.bbox, a.semilla)
+        pipeline(det, a.salida, verdad)
+    elif a.modo == "live":
+        if not a.map_key:
+            sys.exit("Falta la MAP_KEY (--map-key o variable FIRMS_MAP_KEY).")
+        det = descargar_firms(a.map_key, a.bbox, a.inicio, a.fin, a.cache)
+        pipeline(det, a.salida)
+    else:
+        modo_orbitas(a)
+
+
+if __name__ == "__main__":
+    main()
+   
