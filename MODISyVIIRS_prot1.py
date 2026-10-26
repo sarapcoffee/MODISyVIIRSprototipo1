@@ -157,13 +157,14 @@ def simular(inicio, fin, bbox, semilla=42):
 
 # 2. DATOS REALES (FIRMS)
 
-def _get(url, reintentos=3):
+def _get(url, reintentos=2):
     for i in range(reintentos):
         try:
-            with urllib.request.urlopen(url, timeout=60) as r:
+            with urllib.request.urlopen(url, timeout=20) as r:
                 return r.read().decode("utf-8", "replace")
         except Exception:
-            time.sleep(2 * (i + 1))
+            if i + 1 < reintentos:
+                time.sleep(2 * (i + 1))
     return None  # (no se imprime la URL para no exponer la MAP_KEY)
 
 
@@ -194,28 +195,38 @@ def normalizar_firms(raw, sensor_fijo):
     return out
 
 
-def descargar_firms(map_key, bbox, inicio, fin, cache="cache_firms"):
+def descargar_firms(map_key, bbox, inicio, fin, cache="cache_firms", progreso=None):
     """Descarga por tramos de 5 días y guarda en caché (la API limita el rango)."""
     W, S, E, N = bbox
     cache = Path(cache)
     cache.mkdir(parents=True, exist_ok=True)
     hoy = pd.Timestamp.today().normalize()
+    inicio = pd.Timestamp(inicio)
     fin = pd.Timestamp(fin)
     frames = []
+    tramos = {}
     for fuente, sensor_fijo in FIRMS_FUENTES:
-        ini_sensor = pd.Timestamp(SENSORES[sensor_fijo or "Terra"]["inicio"])
-        for d0 in pd.date_range(inicio, fin, freq="5D"):
+        inicio_sensor = pd.Timestamp(SENSORES[sensor_fijo or "Terra"]["inicio"])
+        tramos[fuente] = [
+            d0 for d0 in pd.date_range(inicio, fin, freq="5D")
+            if d0 + pd.Timedelta(days=min(5, (fin - d0).days + 1) - 1) >= inicio_sensor
+            and not (fuente == "VIIRS_SNPP" and d0 > FIN_SNPP)
+        ]
+    total_tramos = sum(map(len, tramos.values()))
+    tramos_completados = 0
+    tramos_sin_respuesta = 0
+
+    for fuente, sensor_fijo in FIRMS_FUENTES:
+        for d0 in tramos[fuente]:
             dias = int(min(5, (fin - d0).days + 1))
             d1 = d0 + pd.Timedelta(days=dias - 1)
-            if d1 < ini_sensor:
-                continue
-            if fuente == "VIIRS_SNPP" and d0 > FIN_SNPP:
-                continue
             f_cache = cache / f"{fuente}_{d0:%Y%m%d}_{dias}d_{W}_{S}_{E}_{N}.csv"
             raw = None
+            desde_cache = False
             if f_cache.exists():
                 try:
                     raw = pd.read_csv(f_cache)
+                    desde_cache = True
                 except pd.errors.EmptyDataError:
                     pass
             if raw is None:
@@ -226,17 +237,26 @@ def descargar_firms(map_key, bbox, inicio, fin, cache="cache_firms"):
                     txt = _get(url)
                     if txt and txt.lstrip().startswith("latitude"):
                         raw = pd.read_csv(io.StringIO(txt))
-                        if len(raw):
-                            break
+                        break
                     elif txt:
                         print(f"  ! respuesta inesperada de {fuente}_{suf}: {txt[:80]!r}", file=sys.stderr)
                 if d1 < hoy - pd.Timedelta(days=3) and len(raw.columns):
                     raw.to_csv(f_cache, index=False)
+            if not len(raw.columns):
+                tramos_sin_respuesta += 1
             if len(raw):
                 frames.append(normalizar_firms(raw, sensor_fijo))
+            tramos_completados += 1
+            if progreso is not None:
+                progreso(tramos_completados, total_tramos, fuente, desde_cache)
         print(f"  {fuente}: listo")
     if not frames:
-        sys.exit("No se descargó ningún foco. Revisa MAP_KEY, bbox y fechas.")
+        if tramos_sin_respuesta:
+            sys.exit(
+                f"La consulta quedó incompleta: FIRMS no respondió en "
+                f"{tramos_sin_respuesta} de {total_tramos} tramos. Revisa la conexión y vuelve a intentar."
+            )
+        sys.exit("FIRMS respondió, pero no encontró focos para el BBOX y las fechas seleccionadas.")
     det = pd.concat(frames, ignore_index=True)
     # MODIS trae Terra+Aqua en la misma fuente: sensores que no existan aún se descartan
     return det
