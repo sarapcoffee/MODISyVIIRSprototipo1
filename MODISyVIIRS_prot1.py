@@ -528,9 +528,21 @@ def pipeline(det, salida, verdad=None):
 
 
 def parse_bbox(txt):
-    p = [float(x) for x in txt.split(",")]
+    try:
+        p = [float(x.strip()) for x in txt.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("bbox debe contener cuatro números: O,S,E,N") from exc
     if len(p) != 4:
-        raise argparse.ArgumentTypeError("bbox = W,S,E,N")
+        raise argparse.ArgumentTypeError("bbox debe contener cuatro valores: O,S,E,N")
+    west, south, east, north = p
+    if not all(np.isfinite(p)):
+        raise argparse.ArgumentTypeError("bbox debe contener coordenadas finitas")
+    if not (-180 <= west <= 180 and -180 <= east <= 180):
+        raise argparse.ArgumentTypeError("las longitudes deben estar entre -180 y 180")
+    if not (-90 <= south <= 90 and -90 <= north <= 90):
+        raise argparse.ArgumentTypeError("las latitudes deben estar entre -90 y 90")
+    if west >= east or south >= north:
+        raise argparse.ArgumentTypeError("bbox requiere O < E y S < N")
     return tuple(p)
 
 
