@@ -59,13 +59,13 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 # CONFIGURACIÓN
-# mlt_diseno = hora local media del paso DIURNO según el diseño de la misión.
+# mlt_diseño = hora local media del paso DIURNO según el diseño de la misión.
 SENSORES = {
-    "Terra":  {"familia": "MODIS", "inicio": "2000-11-01", "mlt_diseno": 10.5},
-    "Aqua":   {"familia": "MODIS", "inicio": "2002-07-03", "mlt_diseno": 13.5},
-    "SNPP":   {"familia": "VIIRS", "inicio": "2012-01-20", "mlt_diseno": 13.5},
-    "NOAA20": {"familia": "VIIRS", "inicio": "2018-04-01", "mlt_diseno": 13.5},
-    "NOAA21": {"familia": "VIIRS", "inicio": "2024-01-17", "mlt_diseno": 13.5},
+    "Terra":  {"familia": "MODIS", "inicio": "2000-11-01", "mlt_diseño": 10.5},
+    "Aqua":   {"familia": "MODIS", "inicio": "2002-07-03", "mlt_diseño": 13.5},
+    "SNPP":   {"familia": "VIIRS", "inicio": "2012-01-20", "mlt_diseño": 13.5},
+    "NOAA20": {"familia": "VIIRS", "inicio": "2018-04-01", "mlt_diseño": 13.5},
+    "NOAA21": {"familia": "VIIRS", "inicio": "2024-01-17", "mlt_diseño": 13.5},
 }
 FIN_SNPP = pd.Timestamp("2026-10-31")  # fin anunciado de la distribución de S-NPP
 
@@ -108,7 +108,7 @@ def mlt_simulado(sensor, años):
     if sensor in _MLT_PUNTOS:
         xs, ys = _MLT_PUNTOS[sensor]
         return np.interp(años, xs, ys)
-    return np.full(len(años), SENSORES[sensor]["mlt_diseno"], float)
+    return np.full(len(años), SENSORES[sensor]["mlt_diseño"], float)
 
 
 def simular(inicio, fin, bbox, semilla=42):
@@ -197,6 +197,7 @@ def normalizar_firms(raw, sensor_fijo):
 
 def descargar_firms(map_key, bbox, inicio, fin, cache="cache_firms", progreso=None):
     """Descarga por tramos de 5 días y guarda en caché (la API limita el rango)."""
+    # Un año entero puede superar las 200 peticiones; probá con pocos días si solo estás verificando algo.
     W, S, E, N = bbox
     cache = Path(cache)
     cache.mkdir(parents=True, exist_ok=True)
@@ -228,6 +229,7 @@ def descargar_firms(map_key, bbox, inicio, fin, cache="cache_firms", progreso=No
                     raw = pd.read_csv(f_cache)
                     desde_cache = True
                 except pd.errors.EmptyDataError:
+                    # Si quedó un archivo vacío/corrupto, seguimos y volvemos a consultar FIRMS.
                     pass
             if raw is None:
                 orden = ["NRT", "SP"] if d0 > hoy - pd.Timedelta(days=90) else ["SP", "NRT"]
@@ -243,6 +245,7 @@ def descargar_firms(map_key, bbox, inicio, fin, cache="cache_firms", progreso=No
                 if d1 < hoy - pd.Timedelta(days=3) and len(raw.columns):
                     raw.to_csv(f_cache, index=False)
             if not len(raw.columns):
+                # Sin columnas: no hubo respuesta usable. Con cabecera y cero filas: FIRMS sí respondió sin focos.
                 tramos_sin_respuesta += 1
             if len(raw):
                 frames.append(normalizar_firms(raw, sensor_fijo))
@@ -292,6 +295,7 @@ def armonizar(c, mlt_emp, tol=UMBRAL_MLT):
     - MODIS: se escala a VIIRS con un factor k calculado en los días en que el
       sensor estaba estable (|MLT - MLT de diseño| <= tol) y VIIRS existía.
     - Antes de VIIRS se usa MODIS estable x k; después, VIIRS."""
+    # Recordatorio: k se estima dentro de los datos consultados; falta validarlo en otro período independiente.
     viirs = [s for s in c.columns if SENSORES[s]["familia"] == "VIIRS"]
     modis = [s for s in c.columns if SENSORES[s]["familia"] == "MODIS"]
     ref = c[viirs].mean(axis=1, skipna=True) if viirs else pd.Series(np.nan, index=c.index)
@@ -303,7 +307,7 @@ def armonizar(c, mlt_emp, tol=UMBRAL_MLT):
             m.index = pd.DatetimeIndex(m.index) + pd.Timedelta(days=45)   # centro del trimestre
             md = (m.reindex(m.index.union(c.index)).interpolate("time", limit_direction="both")
                   .reindex(c.index))
-            estable[s] = (md - SENSORES[s]["mlt_diseno"]).abs() <= tol
+            estable[s] = (md - SENSORES[s]["mlt_diseño"]).abs() <= tol
         else:
             estable[s] = pd.Series(False, index=c.index)
         m_cal = estable[s] & ref.notna() & c[s].notna()
@@ -370,7 +374,7 @@ def graf_mlt(mlt_emp, ruta):
     fig, ax = plt.subplots(figsize=(10, 4.5))
     for s in mlt_emp.columns:
         ax.plot(mlt_emp.index, mlt_emp[s], label=s, color=COLORES.get(s), lw=1.8)
-        ax.axhline(SENSORES[s]["mlt_diseno"], color=COLORES.get(s), ls=":", lw=0.8)
+        ax.axhline(SENSORES[s]["mlt_diseño"], color=COLORES.get(s), ls=":", lw=0.8)
     ax.set_ylabel("Hora solar local del paso diurno (h)")
     ax.set_title("Deriva de hora local estimada desde las detecciones (puntos = hora de diseño)")
     ax.grid(alpha=0.3)
@@ -449,7 +453,7 @@ def modo_orbitas(args):
         fig, ax = plt.subplots(figsize=(10, 4))
         ax.plot(df["epoca"], df["paso_diurno_h"], color=COLORES.get(args.sat, "C0"))
         if args.sat in SENSORES:
-            ax.axhline(SENSORES[args.sat]["mlt_diseno"], color="k", ls=":")
+            ax.axhline(SENSORES[args.sat]["mlt_diseño"], color="k", ls=":")
         ax.set_ylabel("Hora local del paso diurno (h)"); ax.grid(alpha=0.3)
         ax.set_title(f"{args.sat}: hora local desde TLE históricos")
         fig.tight_layout(); fig.savefig(salida / f"04_mlt_tle_{args.sat}.png", dpi=140)
@@ -465,7 +469,7 @@ def modo_orbitas(args):
         e, ltan, dia = hora_local_nodo(*pares[0])
         filas.append(dict(satelite=nombre, epoca=e.strftime("%Y-%m-%d"),
                           ltan_h=round(ltan, 2), paso_diurno_h=round(dia, 2),
-                          desviacion_vs_diseno_h=round(dia - SENSORES[nombre]["mlt_diseno"], 2)))
+                          desviacion_vs_diseño_h=round(dia - SENSORES[nombre]["mlt_diseño"], 2)))
     df = pd.DataFrame(filas)
     df.to_csv(salida / "orbitas_actuales.csv", index=False)
     print(df.to_string(index=False))
