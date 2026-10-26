@@ -423,7 +423,7 @@ with st.expander("Generador visual de BBOX dentro de la página", expanded=True)
                 "rectangle": True,
                 "poly": False,
             },
-            edit_options={"edit": True, "remove": True},
+            edit_options={"edit": True, "remove": False},
         )
         draw.add_to(mapa)
 
