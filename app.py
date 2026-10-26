@@ -326,9 +326,16 @@ with st.sidebar:
 
     inicio = st.date_input("Fecha inicial", date(2023, 1, 1), key="inicio_input")
     fin = st.date_input("Fecha final", date(2023, 12, 30), key="fin_input")
+    if inicio <= fin:
+        tramos_estimados = ((fin - inicio).days // 5 + 1) * 3
+        st.caption(
+            f"FIRMS limita las consultas a 5 días: este intervalo requiere hasta "
+            f"{tramos_estimados} tramos entre sensores. Las consultas completadas se guardan en caché."
+        )
 
     ejecutar = st.button("Consultar FIRMS", type="primary", use_container_width=True)
     if ejecutar:
+        st.session_state.pop("dashboard_error", None)
         try:
             parsed_bbox = validar_bbox(bbox_text)
             if not key:
@@ -337,13 +344,32 @@ with st.sidebar:
                 st.session_state["dashboard_error"] = "La fecha inicial debe ser anterior a la final."
             else:
                 with st.spinner("Consultando detecciones satelitales…"):
-                    det = core.descargar_firms(key, parsed_bbox, inicio.isoformat(), fin.isoformat())
-                    mlt = core.mlt_empirico(det)
-                    conteos = core.conteos_diarios(det)
-                    indice, _, _, _, _ = core.armonizar(conteos, mlt)
-                    matriz = core.matriz_anual(indice.rolling(7, min_periods=4, center=True).mean())
-                    z, valores = core.anomalias(matriz)
-                    criticos = core.periodos_criticos(z, valores, matriz.index.values)
+                    progreso = st.progress(0, text="Preparando consulta a FIRMS…")
+
+                    def actualizar_progreso(completados, total, fuente, desde_cache):
+                        origen = "caché" if desde_cache else "FIRMS"
+                        progreso.progress(
+                            completados / total,
+                            text=f"{fuente}: tramo {completados}/{total} completado ({origen})",
+                        )
+
+                    try:
+                        det = core.descargar_firms(
+                            key,
+                            parsed_bbox,
+                            inicio.isoformat(),
+                            fin.isoformat(),
+                            progreso=actualizar_progreso,
+                        )
+                        progreso.progress(1, text="Procesando detecciones…")
+                        mlt = core.mlt_empirico(det)
+                        conteos = core.conteos_diarios(det)
+                        indice, _, _, _, _ = core.armonizar(conteos, mlt)
+                        matriz = core.matriz_anual(indice.rolling(7, min_periods=4, center=True).mean())
+                        z, valores = core.anomalias(matriz)
+                        criticos = core.periodos_criticos(z, valores, matriz.index.values)
+                    finally:
+                        progreso.empty()
                 st.session_state["dashboard"] = {
                     "detecciones": det,
                     "conteos": conteos,
