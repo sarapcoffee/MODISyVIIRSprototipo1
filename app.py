@@ -55,6 +55,70 @@ def validar_bbox(raw_bbox):
     return (west, south, east, north)
 
 
+def bbox_desde_dibujo(drawing):
+    if not isinstance(drawing, dict):
+        return None
+
+    if drawing.get("type") == "Feature":
+        drawing = drawing.get("geometry") or {}
+
+    if drawing.get("type") == "Polygon":
+        coordinates = drawing.get("coordinates", [])
+        puntos = []
+
+        def recolectar_puntos(coordenadas):
+            if (
+                isinstance(coordenadas, (list, tuple))
+                and len(coordenadas) >= 2
+                and all(isinstance(value, (int, float)) for value in coordenadas[:2])
+            ):
+                puntos.append(coordenadas)
+            elif isinstance(coordenadas, (list, tuple)):
+                for elemento in coordenadas:
+                    recolectar_puntos(elemento)
+
+        recolectar_puntos(coordinates)
+        if puntos:
+            longitudes = [float(punto[0]) for punto in puntos]
+            latitudes = [float(punto[1]) for punto in puntos]
+            return (
+                min(longitudes),
+                min(latitudes),
+                max(longitudes),
+                max(latitudes),
+            )
+
+    bounds = drawing.get("bounds")
+    if isinstance(bounds, dict):
+        southwest = bounds.get("_southWest")
+        northeast = bounds.get("_northEast")
+        if isinstance(southwest, dict) and isinstance(northeast, dict):
+            try:
+                return (
+                    min(float(southwest["lng"]), float(northeast["lng"])),
+                    min(float(southwest["lat"]), float(northeast["lat"])),
+                    max(float(southwest["lng"]), float(northeast["lng"])),
+                    max(float(southwest["lat"]), float(northeast["lat"])),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+
+    if isinstance(bounds, (list, tuple)) and len(bounds) >= 2:
+        try:
+            latitudes = [float(bounds[0][0]), float(bounds[1][0])]
+            longitudes = [float(bounds[0][1]), float(bounds[1][1])]
+        except (IndexError, TypeError, ValueError):
+            return None
+        return (
+            min(longitudes),
+            min(latitudes),
+            max(longitudes),
+            max(latitudes),
+        )
+
+    return None
+
+
 def aplicar_region(region_name):
     if region_name in (None, "Personalizada"):
         return st.session_state.get("bbox_text", "")
@@ -189,7 +253,13 @@ st.markdown(
 )
 
 st.session_state.setdefault("bbox_text", "-56.5502,-33.3985,-56.4950,-33.3520")
-st.session_state.setdefault("selected_region", "Uruguay")
+st.session_state.setdefault("bbox_input", st.session_state["bbox_text"])
+if "bbox_pending" in st.session_state:
+    st.session_state["bbox_text"] = st.session_state["bbox_pending"]
+    st.session_state["bbox_input"] = st.session_state["bbox_pending"]
+    st.session_state["selected_region"] = "Personalizada"
+    st.session_state["region_select"] = "Personalizada"
+    del st.session_state["bbox_pending"]
 
 
 with st.sidebar:
@@ -210,87 +280,87 @@ with st.sidebar:
             """
         )
 
-    with st.form("consulta_firms"):
-        key = st.text_input("FIRMS MAP_KEY", type="password", key="map_key_input")
-        st.caption("Se mantiene solo durante la sesión actual.")
+    key = st.text_input("FIRMS MAP_KEY", type="password", key="map_key_input")
+    st.caption("Se mantiene solo durante la sesión actual.")
 
-        st.markdown("### Paso 2 · Seleccionar región")
-        regiones = list(REGIONES_PREDEFINIDAS.keys())
-        region_choice = st.selectbox(
-            "Región predefinida",
-            regiones,
-            index=regiones.index(st.session_state.get("selected_region", "Uruguay")),
-            key="region_select",
-        )
+    st.markdown("### Paso 2 · Seleccionar región")
+    regiones = list(REGIONES_PREDEFINIDAS.keys())
+    region_choice = st.selectbox(
+        "Región predefinida",
+        regiones,
+        index=regiones.index(st.session_state.get("selected_region", "Uruguay")),
+        key="region_select",
+    )
+    if region_choice != st.session_state.get("selected_region"):
         if region_choice != "Personalizada":
             st.session_state["bbox_text"] = aplicar_region(region_choice)
+            st.session_state["bbox_input"] = st.session_state["bbox_text"]
         st.session_state["selected_region"] = region_choice
 
-        with st.expander("¿Qué es un BBOX y cómo funciona?", expanded=False):
-            st.markdown(
-                """
-                Un BBOX (Bounding Box) es un rectángulo geográfico que delimita la zona de análisis.\n
-                NASA FIRMS usa cuatro valores en este orden: OESTE, SUR, ESTE, NORTE.\n
-                Ejemplo aproximado para Uruguay: `-58.5,-35.2,-53,-30`\n
-                - Oeste: límite occidental\n
-                - Sur: latitud mínima\n
-                - Este: límite oriental\n
-                - Norte: latitud máxima\n
-                El rectángulo se forma con esos cuatro límites.
-                """
-            )
-
-        bbox_text = st.text_input(
-            "BBox · O, S, E, N",
-            st.session_state["bbox_text"],
-            help="Formato esperado: oeste,sur,este,norte",
-            key="bbox_input",
+    with st.expander("¿Qué es un BBOX y cómo funciona?", expanded=False):
+        st.markdown(
+            """
+            Un BBOX (Bounding Box) es un rectángulo geográfico que delimita la zona de análisis.\n
+            NASA FIRMS usa cuatro valores en este orden: OESTE, SUR, ESTE, NORTE.\n
+            Ejemplo aproximado para Uruguay: `-58.5,-35.2,-53,-30`\n
+            - Oeste: límite occidental\n
+            - Sur: latitud mínima\n
+            - Este: límite oriental\n
+            - Norte: latitud máxima\n
+            El rectángulo se forma con esos cuatro límites.
+            """
         )
-        st.session_state["bbox_text"] = bbox_text
 
+    bbox_text = st.text_input(
+        "BBox · O, S, E, N",
+        help="Formato esperado: oeste,sur,este,norte",
+        key="bbox_input",
+    )
+    st.session_state["bbox_text"] = bbox_text
+
+    try:
+        validar_bbox(bbox_text)
+        st.success("BBox válido para NASA FIRMS.")
+    except ValueError as exc:
+        st.warning(str(exc))
+
+    inicio = st.date_input("Fecha inicial", date(2023, 1, 1), key="inicio_input")
+    fin = st.date_input("Fecha final", date(2023, 12, 30), key="fin_input")
+
+    ejecutar = st.button("Consultar FIRMS", type="primary", use_container_width=True)
+    if ejecutar:
         try:
-            validar_bbox(bbox_text)
-            st.success("BBox válido para NASA FIRMS.")
+            parsed_bbox = validar_bbox(bbox_text)
+            if not key:
+                st.session_state["dashboard_error"] = "Ingresa tu MAP_KEY de FIRMS."
+            elif inicio > fin:
+                st.session_state["dashboard_error"] = "La fecha inicial debe ser anterior a la final."
+            else:
+                with st.spinner("Consultando detecciones satelitales…"):
+                    det = core.descargar_firms(key, parsed_bbox, inicio.isoformat(), fin.isoformat())
+                    mlt = core.mlt_empirico(det)
+                    conteos = core.conteos_diarios(det)
+                    indice, _, _, _, _ = core.armonizar(conteos, mlt)
+                    matriz = core.matriz_anual(indice.rolling(7, min_periods=4, center=True).mean())
+                    z, valores = core.anomalias(matriz)
+                    criticos = core.periodos_criticos(z, valores, matriz.index.values)
+                st.session_state["dashboard"] = {
+                    "detecciones": det,
+                    "conteos": conteos,
+                    "indice": indice,
+                    "mlt": mlt,
+                    "criticos": criticos,
+                    "bbox": parsed_bbox,
+                    "inicio": inicio,
+                    "fin": fin,
+                }
+                st.session_state.pop("dashboard_error", None)
         except ValueError as exc:
-            st.warning(str(exc))
-
-        inicio = st.date_input("Fecha inicial", date(2023, 1, 1), key="inicio_input")
-        fin = st.date_input("Fecha final", date(2023, 12, 30), key="fin_input")
-
-        ejecutar = st.form_submit_button("Consultar FIRMS", type="primary", use_container_width=True)
-        if ejecutar:
-            try:
-                parsed_bbox = validar_bbox(bbox_text)
-                if not key:
-                    st.session_state["dashboard_error"] = "Ingresa tu MAP_KEY de FIRMS."
-                elif inicio > fin:
-                    st.session_state["dashboard_error"] = "La fecha inicial debe ser anterior a la final."
-                else:
-                    with st.spinner("Consultando detecciones satelitales…"):
-                        det = core.descargar_firms(key, parsed_bbox, inicio.isoformat(), fin.isoformat())
-                        mlt = core.mlt_empirico(det)
-                        conteos = core.conteos_diarios(det)
-                        indice, _, _, _, _ = core.armonizar(conteos, mlt)
-                        matriz = core.matriz_anual(indice.rolling(7, min_periods=4, center=True).mean())
-                        z, valores = core.anomalias(matriz)
-                        criticos = core.periodos_criticos(z, valores, matriz.index.values)
-                    st.session_state["dashboard"] = {
-                        "detecciones": det,
-                        "conteos": conteos,
-                        "indice": indice,
-                        "mlt": mlt,
-                        "criticos": criticos,
-                        "bbox": parsed_bbox,
-                        "inicio": inicio,
-                        "fin": fin,
-                    }
-                    st.session_state.pop("dashboard_error", None)
-            except ValueError as exc:
-                st.session_state["dashboard_error"] = str(exc)
-            except SystemExit as exc:
-                st.session_state["dashboard_error"] = str(exc)
-            except Exception as exc:
-                st.session_state["dashboard_error"] = f"No se pudieron procesar los datos: {exc}"
+            st.session_state["dashboard_error"] = str(exc)
+        except SystemExit as exc:
+            st.session_state["dashboard_error"] = str(exc)
+        except Exception as exc:
+            st.session_state["dashboard_error"] = f"No se pudieron procesar los datos: {exc}"
 
 st.markdown(
     """
@@ -340,22 +410,20 @@ with st.expander("Generador visual de BBOX dentro de la página", expanded=True)
             pass
 
         map_output = st_folium(mapa, width=900, height=430, key="bbox_map")
-        if map_output and map_output.get("last_active_drawing"):
-            drawing = map_output["last_active_drawing"]
-            if drawing.get("type") == "rectangle":
-                bounds = drawing.get("bounds")
-                if bounds:
-                    all_lats = [float(bounds[0][0]), float(bounds[1][0])]
-                    all_lngs = [float(bounds[0][1]), float(bounds[1][1])]
-                    west = min(all_lngs)
-                    east = max(all_lngs)
-                    south = min(all_lats)
-                    north = max(all_lats)
-                    st.session_state["bbox_text"] = f"{west},{south},{east},{north}"
+        drawing = map_output.get("last_active_drawing") if map_output else None
+        if not drawing and map_output and map_output.get("all_drawings"):
+            drawing = map_output["all_drawings"][-1]
+        bounds = bbox_desde_dibujo(drawing)
+        if bounds:
+            bbox = ",".join(f"{value:.6f}" for value in bounds)
+            if bbox != st.session_state.get("bbox_drawing_applied"):
+                st.session_state["bbox_drawing_applied"] = bbox
+                if bbox != st.session_state.get("bbox_input", st.session_state["bbox_text"]):
+                    st.session_state["bbox_pending"] = bbox
                     st.rerun()
 
         if st.button("Limpiar selección", use_container_width=True):
-            st.session_state["bbox_text"] = ""
+            st.session_state["bbox_pending"] = ""
             st.rerun()
 
 if "dashboard" in st.session_state:
