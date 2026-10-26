@@ -334,6 +334,30 @@ st.markdown(
         color: var(--forest);
         border-bottom-color: var(--signal);
     }
+    div[data-testid="stButton"] > button:not([kind="primary"]),
+    div[data-testid="stDownloadButton"] > button {
+        background: var(--forest);
+        border: 1px solid var(--forest);
+        color: #fff !important;
+        border-radius: 4px;
+        font-weight: 700;
+    }
+    div[data-testid="stButton"] > button:not([kind="primary"]) *,
+    div[data-testid="stDownloadButton"] > button * {
+        color: #fff !important;
+        -webkit-text-fill-color: #fff !important;
+        opacity: 1 !important;
+    }
+    div[data-testid="stButton"] > button:not([kind="primary"]):hover,
+    div[data-testid="stDownloadButton"] > button:hover {
+        background: #24483e;
+        border-color: #24483e;
+        color: #fff !important;
+    }
+    div[data-testid="stDownloadButton"] > button:hover {
+        background: #24483e;
+        border-color: #24483e;
+    }
     div.stButton > button[kind="primary"] {
         background: var(--signal);
         border: 1px solid var(--signal);
@@ -358,6 +382,7 @@ st.markdown(
 
 st.session_state.setdefault("bbox_text", "-56.5502,-33.3985,-56.4950,-33.3520")
 st.session_state.setdefault("bbox_input", st.session_state["bbox_text"])
+# El mapa entrega el BBOX en otro rerun, guardo el cambio pendiente y lo aplico.
 if "bbox_pending" in st.session_state:
     st.session_state["bbox_text"] = st.session_state["bbox_pending"]
     st.session_state["bbox_input"] = st.session_state["bbox_pending"]
@@ -431,6 +456,7 @@ with st.sidebar:
     inicio = st.date_input("Fecha inicial", date(2023, 1, 1), key="inicio_input")
     fin = st.date_input("Fecha final", date(2023, 12, 30), key="fin_input")
     if st.button("Explorar demostración sintética", use_container_width=True):
+        # Ojo: es un ejemplo simulado para explorar la interfaz, NO son datos reales de NASA.
         demo_bbox = validar_bbox(bbox_text)
         demo_inicio = pd.Timestamp("2018-01-01")
         demo_fin = pd.Timestamp("2025-12-31")
@@ -450,6 +476,7 @@ with st.sidebar:
     ejecutar = st.button("Consultar FIRMS", type="primary", use_container_width=True)
     if ejecutar:
         st.session_state.pop("dashboard_error", None)
+        # Así no dejo a la vista el resultado anterior mientras llega la consulta nueva del usuario que lo use.
         st.session_state.pop("dashboard", None)
         try:
             parsed_bbox = validar_bbox(bbox_text)
@@ -538,6 +565,7 @@ with st.expander("Generador visual de BBOX dentro de la página", expanded=True)
         except ValueError:
             pass
 
+        # Mantener esta key estable para que Streamlit no reinicie el estado del mapa en cada rerun!
         map_output = st_folium(mapa, width=900, height=430, key="bbox_map")
         drawing = map_output.get("last_active_drawing") if map_output else None
         if not drawing and map_output and map_output.get("all_drawings"):
@@ -552,6 +580,7 @@ with st.expander("Generador visual de BBOX dentro de la página", expanded=True)
                     st.rerun()
 
         if st.button("Limpiar selección", use_container_width=True):
+            # La caja de texto toma este valor al comienzo del siguiente rerun.
             st.session_state["bbox_pending"] = ""
             st.rerun()
 
@@ -629,6 +658,7 @@ if "dashboard" in st.session_state:
 
         base = pd.DataFrame({"fecha": valores.index, "valor": valores.to_numpy()})
         if modo == "Anomalías":
+            # La referencia usa el mismo intervalo consultado, es exploratoria, no una climatología independiente.
             base["valor"] = data["anomalias"].reindex(base["fecha"]).to_numpy()
             unidad = "Anomalía z exploratoria, calculada sobre el período consultado"
             divergente = True
